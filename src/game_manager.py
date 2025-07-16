@@ -17,6 +17,7 @@ from src.character_manager import Character
 import src.utils as utils
 from src.http.communication_constants import communication_constants as comm_consts
 from src.stt import Transcriber
+from src.telemetry.telemetry import create_span
 
 class CharacterDoesNotExist(Exception):
     """Exception raised when NPC name cannot be found in skyrim_characters.csv/fallout4_characters.csv"""
@@ -63,8 +64,14 @@ class GameStateManager:
         context_for_conversation = context(world_id, self.__config, self.__client, self.__rememberer, self.__language_info, self.__client.is_text_too_long)
         self.__talk = conversation(context_for_conversation, self.__chat_manager, self.__rememberer, self.__client, self.__stt, self.__mic_input, self.__mic_ptt)
         self.__update_context(input_json)
+
+        characters_in_conversation = self.__talk.context.npcs_in_conversation.get_all_characters()
+        character_names = [char.name for char in characters_in_conversation]
+        logging.info(f"Starting conversation with characters: {', '.join(character_names)}")
+
         character_to_talk = self.__talk.context.npcs_in_conversation.last_added_character
-        self.__talk.output_manager.tts.change_voice(character_to_talk.tts_voice_model, character_to_talk.in_game_voice_model, character_to_talk.csv_in_game_voice_model, character_to_talk.advanced_voice_model, character_to_talk.voice_accent)
+        with create_span(name="tts.change_voice", attributes={"tts_voice_model": character_to_talk.tts_voice_model, "in_game_voice_model": character_to_talk.in_game_voice_model, "csv_in_game_voice_model": character_to_talk.csv_in_game_voice_model, "advanced_voice_model": character_to_talk.advanced_voice_model, "voice_accent": character_to_talk.voice_accent}):
+            self.__talk.output_manager.tts.change_voice(character_to_talk.tts_voice_model, character_to_talk.in_game_voice_model, character_to_talk.csv_in_game_voice_model, character_to_talk.advanced_voice_model, character_to_talk.voice_accent)
         self.__talk.start_conversation()
         
         return {comm_consts.KEY_REPLYTYPE: comm_consts.KEY_REPLYTTYPE_STARTCONVERSATIONCOMPLETED}

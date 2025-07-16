@@ -18,6 +18,8 @@ import queue
 import threading
 import time
 
+from src.telemetry.telemetry import span
+
 @dataclass
 class TranscriptionJob:
     id: str
@@ -112,6 +114,7 @@ class Transcriber:
         return self.__stop_listening
 
     @utils.time_it
+    @span(name="stt.generate_sync_client")
     def __generate_sync_client(self):
         if self.__initial_client:
             client = self.__initial_client
@@ -165,6 +168,7 @@ If you would prefer to run speech-to-text locally, please ensure the `Speech-to-
     
 
     @utils.time_it
+    @span(name="stt.whisper_transcribe")
     def whisper_transcribe(self, audio, prompt: str):
         if self.transcribe_model: # local model
             segments, info = self.transcribe_model.transcribe(audio, task=self.task, language=self.language, beam_size=5, vad_filter=True, initial_prompt=prompt)

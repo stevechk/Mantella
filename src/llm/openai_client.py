@@ -1,3 +1,4 @@
+from asyncio import CancelledError
 from threading import Lock
 import src.utils as utils
 from typing import AsyncGenerator, List
@@ -13,6 +14,7 @@ from src.config.config_loader import ConfigLoader
 from src.image.image_manager import ImageManager
 import os
 from pathlib import Path
+from src.telemetry.telemetry import create_span, add_global_attribute, create_span_with_parent, span
 
         
 class LLMModelList:            
@@ -206,6 +208,7 @@ class openai_client:
 
 
     @utils.time_it
+    @span(name="generate_sync_client")
     def generate_sync_client(self) -> OpenAI:
         """Generates a new OpenAI client already setup to be used right away.
         Close the client after usage using 'client.close()'
@@ -221,7 +224,7 @@ class openai_client:
             return OpenAI(api_key=self._api_key, default_headers=self._header)
     
     @utils.time_it
-    async def streaming_call(self, messages: message_thread, is_multi_npc: bool) -> AsyncGenerator[str | None, None]:
+    async def streaming_call(self, messages: message_thread, is_multi_npc: bool, parent_context) -> AsyncGenerator[str | None, None]:
         """A standard streaming call to the LLM. Forwards the output of 'client.chat.completions.create' 
         This method generates a new client, calls 'client.chat.completions.create' in a streaming way, yields the result immediately and closes when finished
 
@@ -236,56 +239,97 @@ class openai_client:
             Iterator[AsyncGenerator[str | None, None]]: Yields the return of the 'client.chat.completions.create' method immediately
         """
         with self._generation_lock:
-            logging.info('Getting LLM response...')
+            with create_span_with_parent("llm_streaming_call", parent_context) as span:
+                try:
+                    span.set_attribute("llm.model", self.model_name)
+                    span.set_attribute("llm.provider", "openai" if self._base_url is None else "custom")
+                    span.set_attribute("llm.is_local", self._is_local)
+                    span.set_attribute("llm.is_multi_npc", is_multi_npc)
+                    span.set_attribute("llm.max_tokens", self._max_tokens if not is_multi_npc else 250)
+                    span.set_attribute("llm.temperature", self._temperature)
+                    span.set_attribute("llm.top_p", self._top_p)
+                    span.set_attribute("llm.frequency_penalty", self._frequency_penalty)
+                    span.set_attribute("llm.vision_enabled", self.__vision_enabled)
+                    
+                    # Add message context
+                    message_count = len(messages.get_openai_messages())
+                    span.set_attribute("llm.message_count", message_count)
+                    span.set_attribute("llm.token_count", self.calculate_tokens_from_messages(messages))
+                    
+                    logging.info('Getting LLM response...')
 
-            if self._startup_async_client:
-                async_client = self._startup_async_client
-                self._startup_async_client = None # do not reuse the same client
-            else:
-                async_client = self.generate_async_client()
-            
-            max_tokens = self._max_tokens
-            if is_multi_npc: # override max_tokens in radiant / multi-NPC conversations
-                max_tokens = 250
-            try:
-                # Prepare the messages including the image if provided
-                openai_messages = messages.get_openai_messages()
-                if self.__vision_enabled:
-                    openai_messages = self.__image_manager.add_image_to_messages(openai_messages)
-
-                async for chunk in await async_client.chat.completions.create(
-                    model=self.model_name, 
-                    messages=openai_messages, 
-                    stream=True,
-                    stop=self._stop,
-                    temperature=self._temperature,
-                    top_p=self._top_p,
-                    frequency_penalty=self._frequency_penalty, 
-                    max_tokens=max_tokens
-                ):
-                    if chunk and chunk.choices and chunk.choices.__len__() > 0 and chunk.choices[0].delta:
-                        yield chunk.choices[0].delta.content
+                    if self._startup_async_client:
+                        async_client = self._startup_async_client
+                        self._startup_async_client = None # do not reuse the same client
                     else:
-                        break
-            except Exception as e:
-                if isinstance(e, APIConnectionError):
-                    if e.code in [401, 'invalid_api_key']: # incorrect API key
-                        if self._base_url == None: # None = OpenAI
-                            service_connection_attempt = 'OpenRouter' # check if player means to connect to OpenRouter
+                        async_client = self.generate_async_client()
+                    
+                    max_tokens = self._max_tokens
+                    if is_multi_npc: # override max_tokens in radiant / multi-NPC conversations
+                        max_tokens = 250
+                    
+                    try:
+                        # Prepare the messages including the image if provided
+                        openai_messages = messages.get_openai_messages()
+                        if self.__vision_enabled:
+                            openai_messages = self.__image_manager.add_image_to_messages(openai_messages)
+                            span.set_attribute("llm.has_image", True)
+
+                        # Start timing the API call
+                        start_time = time.time()
+                        
+                        async for chunk in await async_client.chat.completions.create(
+                            model=self.model_name, 
+                            messages=openai_messages, 
+                            stream=True,
+                            stop=self._stop,
+                            temperature=self._temperature,
+                            top_p=self._top_p,
+                            frequency_penalty=self._frequency_penalty, 
+                            max_tokens=max_tokens
+                        ):
+                            if chunk and chunk.choices and chunk.choices.__len__() > 0 and chunk.choices[0].delta:
+                                yield chunk.choices[0].delta.content
+                            else:
+                                logging.info("Exit chunking")
+                                break
+
+                        logging.info("Chat chunking complete")
+                        
+                    except CancelledError as e:
+                        logging.info(f"LLM API call cancelled")
+
+                    except Exception as e:
+                        # Record error in span
+                        span.record_exception(e)
+                        span.set_attribute("llm.status", "error")
+                        span.set_attribute("llm.error.type", type(e).__name__)
+                        span.set_attribute("llm.error.message", str(e))
+                        
+                        if isinstance(e, APIConnectionError):
+                            if e.code in [401, 'invalid_api_key']: # incorrect API key
+                                if self._base_url == None: # None = OpenAI
+                                    service_connection_attempt = 'OpenRouter' # check if player means to connect to OpenRouter
+                                else:
+                                    service_connection_attempt = 'OpenAI' # check if player means to connect to OpenAI
+                                logging.error(f"Invalid API key. If you are trying to connect to {service_connection_attempt}, please choose an {service_connection_attempt} model via the 'model' setting in MantellaSoftware/config.ini. If you are instead trying to connect to a local model, please ensure the service is running.")
+                            else:
+                                logging.error(f"LLM API Error: {e}")
+                        elif isinstance(e, BadRequestError):
+                            if (e.type == 'invalid_request_error') and (self.__vision_enabled): # invalid request
+                                logging.error(f"Invalid request. Try disabling Vision in Mantella's settings and try again.")
+                            else:
+                                logging.error(f"LLM API Error: {e}")
                         else:
-                            service_connection_attempt = 'OpenAI' # check if player means to connect to OpenAI
-                        logging.error(f"Invalid API key. If you are trying to connect to {service_connection_attempt}, please choose an {service_connection_attempt} model via the 'model' setting in MantellaSoftware/config.ini. If you are instead trying to connect to a local model, please ensure the service is running.")
-                    else:
-                        logging.error(f"LLM API Error: {e}")
-                elif isinstance(e, BadRequestError):
-                    if (e.type == 'invalid_request_error') and (self.__vision_enabled): # invalid request
-                        logging.error(f"Invalid request. Try disabling Vision in Mantella's settings and try again.")
-                    else:
-                        logging.error(f"LLM API Error: {e}")
-                else:
-                    logging.error(f"LLM API Error: {e}")
-            finally:
-                await async_client.close()
+                            logging.error(f"LLM API Error: {e}")
+                    finally:
+                        try:
+                            await async_client.close()
+                        except Exception as e:
+                            logging.error(f"Error closing async client: {e}")
+                except Exception as e:
+                    # Handle any exceptions during span creation or management
+                    logging.error(f"Error in span management: {e}")
 
     @utils.time_it
     def request_call(self, messages: message_thread) -> str | None:
@@ -299,28 +343,74 @@ class openai_client:
             str | None: The reply of the LLM
         """
         with self._generation_lock:
-            sync_client = self.generate_sync_client()        
-            chat_completion = None
-            logging.info('Getting LLM response...')
-            
-            try:            
-                chat_completion = sync_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages.get_openai_messages(),
-                    max_tokens=1_000
-                )
-            except RateLimitError:
-                logging.warning('Could not connect to LLM API, retrying in 5 seconds...')
-                time.sleep(5)
-            finally:
-                sync_client.close()
-            
-            if not chat_completion or chat_completion.choices.__len__() < 1 or not chat_completion.choices[0].message.content:
-                logging.error(f"LLM Response failed. Received: {chat_completion}")
-                return None
-            
-            reply = chat_completion.choices[0].message.content
-            return reply
+            # Create span for LLM request call
+            with create_span("llm_request_call") as span:
+                span.set_attribute("llm.model", self.model_name)
+                span.set_attribute("llm.provider", "openai" if self._base_url is None else "custom")
+                span.set_attribute("llm.is_local", self._is_local)
+                span.set_attribute("llm.max_tokens", 1000)  # Fixed for request_call
+                span.set_attribute("llm.vision_enabled", self.__vision_enabled)
+                
+                # Add message context
+                message_count = len(messages.get_openai_messages())
+                span.set_attribute("llm.message_count", message_count)
+                span.set_attribute("llm.token_count", self.calculate_tokens_from_messages(messages))
+                
+                sync_client = self.generate_sync_client()        
+                chat_completion = None
+                logging.info('Getting LLM response...')
+                
+                try:
+                    start_time = time.time()
+                    chat_completion = sync_client.chat.completions.create(
+                        model=self.model_name,
+                        messages=messages.get_openai_messages(),
+                        max_tokens=1_000
+                    )
+                    
+                    # Record successful completion
+                    duration = time.time() - start_time
+                    span.set_attribute("llm.duration_seconds", duration)
+                    span.set_attribute("llm.status", "success")
+                    span.add_event("llm.request_completed", {"duration_seconds": duration})
+                    
+                except RateLimitError as e:
+                    # Record rate limit error
+                    span.record_exception(e)
+                    span.set_attribute("llm.status", "rate_limited")
+                    span.set_attribute("llm.error.type", "RateLimitError")
+                    span.set_attribute("llm.error.message", str(e))
+                    logging.warning('Could not connect to LLM API, retrying in 5 seconds...')
+                    time.sleep(5)
+                except Exception as e:
+                    logging.error(f"LLM API Error: {e}")
+                    try:
+                        # Record other errors
+                        span.record_exception(e)
+                        span.set_attribute("llm.status", "error")
+                        span.set_attribute("llm.error.type", type(e).__name__)
+                        span.set_attribute("llm.error.message", str(e))
+                    except Exception as span_error:
+                        logging.error(f"Could not record exception in span: {span_error}")
+
+                finally:
+                    sync_client.close()
+                
+                if not chat_completion or chat_completion.choices.__len__() < 1 or not chat_completion.choices[0].message.content:
+                    logging.error(f"LLM Response failed. Received: {chat_completion}")
+                    try:
+                        span.set_attribute("llm.status", "failed")
+                        span.set_attribute("llm.error.message", "No valid response from LLM")
+                    except Exception as span_error:
+                        logging.error(f"Could not set LLM response failed span attributes: {span_error}")
+                    return None
+                
+                reply = chat_completion.choices[0].message.content
+                try:
+                    span.set_attribute("llm.response_length", len(reply))
+                except Exception as span_error:
+                    logging.error(f"Could not set LLM response length span attribute: {span_error}")
+                return reply
     
     @utils.time_it
     def num_tokens_from_messages(self, messages: message_thread | list[message]) -> int:
@@ -509,11 +599,9 @@ class openai_client:
                 # NOTE: while a secret key is not needed for this request, this may change in the future
                 client = OpenAI(api_key=secret_key, base_url='https://openrouter.ai/api/v1')
                 # don't log initial 'HTTP Request: GET https://openrouter.ai/api/v1/models "HTTP/1.1 200 OK"'
-                logging.getLogger('openai').setLevel(logging.ERROR)
-                logging.getLogger("httpx").setLevel(logging.ERROR)
+                logging.getLogger('openai').setLevel(logging.DEBUG)
+                logging.getLogger("httpx").setLevel(logging.DEBUG)
                 models = client.models.list()
-                logging.getLogger('openai').setLevel(logging.INFO)
-                logging.getLogger("httpx").setLevel(logging.INFO)
                 client.close()
                 allow_manual_model_input = False
 
@@ -586,34 +674,64 @@ class function_client(openai_client):
             str | None: The reply of the LLM
         """
         with self._generation_lock:
-            if self._startup_sync_client:
-                sync_client = self._startup_sync_client
-                self._startup_sync_client = None # do not reuse the same client
-            else:
-                sync_client = self.generate_sync_client()     
-            chat_completion = None
-            logging.info('Getting Function LLM response...')
-            openai_messages = messages.get_openai_messages()
-            try:            
-                params = {
-                'model': self.model_name,
-                'messages': openai_messages,
-                'stop': self._stop,
-                'temperature': self._temperature,
-                'top_p': self._top_p,
-                'frequency_penalty': self._frequency_penalty,
-                'max_tokens': self._max_tokens,
-                }
-            
-                if not self._base_url:
-                    params['tools'] = tools_list  # Include tools only if self._base_url is False or None
+            # Create span for function LLM request call
+            with create_span("llm_function_call") as span:
+                span.set_attribute("llm.model", self.model_name)
+                span.set_attribute("llm.provider", "openai" if self._base_url is None else "custom")
+                span.set_attribute("llm.is_local", self._is_local)
+                span.set_attribute("llm.max_tokens", self._max_tokens)
+                span.set_attribute("llm.temperature", self._temperature)
+                span.set_attribute("llm.top_p", self._top_p)
+                span.set_attribute("llm.frequency_penalty", self._frequency_penalty)
+                span.set_attribute("llm.has_tools", len(tools_list) > 0 if tools_list else False)
+                span.set_attribute("llm.tools_count", len(tools_list) if tools_list else 0)
+                
+                # Add message context
+                message_count = len(messages.get_openai_messages())
+                span.set_attribute("llm.message_count", message_count)
+                span.set_attribute("llm.token_count", self.calculate_tokens_from_messages(messages))
+                
+                if self._startup_sync_client:
+                    sync_client = self._startup_sync_client
+                    self._startup_sync_client = None # do not reuse the same client
+                else:
+                    sync_client = self.generate_sync_client()     
+                chat_completion = None
+                logging.info('Getting Function LLM response...')
+                openai_messages = messages.get_openai_messages()
+                
+                try:            
+                    params = {
+                    'model': self.model_name,
+                    'messages': openai_messages,
+                    'stop': self._stop,
+                    'temperature': self._temperature,
+                    'top_p': self._top_p,
+                    'frequency_penalty': self._frequency_penalty,
+                    'max_tokens': self._max_tokens,
+                    }
+                
+                    if not self._base_url:
+                        params['tools'] = tools_list  # Include tools only if self._base_url is False or None
 
-                start_time = time.time()
-                chat_completion = sync_client.chat.completions.create(**params)
+                    start_time = time.time()
+                    chat_completion = sync_client.chat.completions.create(**params)
 
-                logging.log(28, f"Function LLM took {round(time.time() - start_time, 2)} seconds to respond")
+                    # Record successful completion
+                    duration = time.time() - start_time
+                    span.set_attribute("llm.duration_seconds", duration)
+                    span.set_attribute("llm.status", "success")
+                    span.add_event("llm.function_call_completed", {"duration_seconds": duration})
+                    
+                    logging.log(28, f"Function LLM took {round(time.time() - start_time, 2)} seconds to respond")
 
-            except Exception as e:
+                except Exception as e:
+                    # Record error in span
+                    span.record_exception(e)
+                    span.set_attribute("llm.status", "error")
+                    span.set_attribute("llm.error.type", type(e).__name__)
+                    span.set_attribute("llm.error.message", str(e))
+                    
                     if isinstance(e, APIConnectionError):
                         if e.code in [401, 'invalid_api_key']: # incorrect API key
                             if self._base_url == None: # None = OpenAI
@@ -630,27 +748,32 @@ class function_client(openai_client):
                             logging.error(f"LLM API Error: {e}")
                     else:
                         logging.error(f"LLM API Error: {e}")
-            finally:
-                sync_client.close()
-            
-            if self._base_url:
-                if (
-                    not chat_completion
-                    or not hasattr(chat_completion, 'choices')
-                    or not chat_completion.choices
-                    or not hasattr(chat_completion.choices[0], 'message')
-                    or not hasattr(chat_completion.choices[0].message, 'content')
-                    or not chat_completion.choices[0].message.content
-                ):
-                    logging.error(f"Non OpenAI LLM Response failed. Received: {chat_completion}")
-                    
-                    return None 
-            else:
-            #if not chat_completion :
-                #if not chat_completion or chat_completion.choices.__len__() < 1 or not chat_completion.choices[0].message.content:
-                if not chat_completion :
-                    logging.error(f"OpenAI LLM Response failed")
-                    return None           
-            chat_completion_json = json.dumps(chat_completion, default=lambda o: o.__dict__)
-            logging.debug(f"Function LLM : Received json file :  {chat_completion_json}")
-            return chat_completion_json
+                finally:
+                    sync_client.close()
+                
+                if self._base_url:
+                    if (
+                        not chat_completion
+                        or not hasattr(chat_completion, 'choices')
+                        or not chat_completion.choices
+                        or not hasattr(chat_completion.choices[0], 'message')
+                        or not hasattr(chat_completion.choices[0].message, 'content')
+                        or not chat_completion.choices[0].message.content
+                    ):
+                        span.set_attribute("llm.status", "failed")
+                        span.set_attribute("llm.error.message", "Non OpenAI LLM Response failed")
+                        logging.error(f"Non OpenAI LLM Response failed. Received: {chat_completion}")
+                        
+                        return None 
+                else:
+                    if not chat_completion:
+                        span.set_attribute("llm.status", "failed")
+                        span.set_attribute("llm.error.message", "OpenAI LLM Response failed")
+                        logging.error(f"OpenAI LLM Response failed")
+                        return None           
+                
+                chat_completion_json = json.dumps(chat_completion, default=lambda o: o.__dict__)
+                span.set_attribute("llm.response_length", len(chat_completion_json))
+                span.set_attribute("llm.response", chat_completion_json)
+                logging.debug(f"Function LLM : Received json file :  {chat_completion_json}")
+                return chat_completion_json

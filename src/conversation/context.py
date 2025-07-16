@@ -416,7 +416,7 @@ class context:
             else:
                 break
         
-        logging.log(23, f'Prompt sent to LLM ({self.__client.calculate_tokens_from_text(result)} tokens): {result.strip()}')
+        logging.log(23, f'Prompt sent to LLM: {self.__client.calculate_tokens_from_text(result)} tokens')
         if have_summaries_been_dropped and have_bios_been_dropped:
             logging.log(logging.WARNING, f'Both the bios and summaries of the NPCs selected could not fit into the maximum prompt size of {int(round(self.__client.token_limit * self.TOKEN_LIMIT_PERCENT, 0))} tokens. NPCs will not remember previous conversations and will have limited knowledge of who they are.')
         elif have_summaries_been_dropped:

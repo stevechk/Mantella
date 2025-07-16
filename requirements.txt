@@ -23,3 +23,9 @@ furo==2023.9.10
 pywin32==306
 mss==9.0.1
 opencv-python==4.10.0.84
+# OpenTelemetry packages for tracing
+opentelemetry-api==1.27.0
+opentelemetry-sdk==1.27.0
+opentelemetry-exporter-otlp-proto-grpc==1.27.0
+opentelemetry-instrumentation-requests
+opentelemetry-instrumentation-logging

@@ -21,6 +21,9 @@ from src.llm.message_thread import message_thread
 from src.llm.openai_client import openai_client, function_client
 from src.tts.ttsable import ttsable
 from src.tts.synthesization_options import SynthesizationOptions
+from opentelemetry import context as otel_context
+
+from src.telemetry.telemetry import create_span
 
 class ChatManager:
     @utils.time_it
@@ -76,7 +79,9 @@ class ChatManager:
         with self.__tts_access_lock:
             try:
                 synth_options = SynthesizationOptions(character_to_talk.is_in_combat, is_first_line_of_response)
-                audio_file = self.__tts.synthesize(character_to_talk.tts_voice_model, text, character_to_talk.in_game_voice_model, character_to_talk.csv_in_game_voice_model, character_to_talk.voice_accent, synth_options, character_to_talk.advanced_voice_model)
+                logging.log(22, f'Synthesizing voiceline [{character_to_talk.name}]: {text.strip()}')
+                with create_span(name="tts_synthesize", attributes={"character_name": character_to_talk.name, "text": text.strip()}):
+                    audio_file = self.__tts.synthesize(character_to_talk.tts_voice_model, text, character_to_talk.in_game_voice_model, character_to_talk.csv_in_game_voice_model, character_to_talk.voice_accent, synth_options, character_to_talk.advanced_voice_model)
             except Exception as e:
                 error_text = f"Text-to-Speech Error: {e}"
                 logging.log(29, error_text)
@@ -112,7 +117,8 @@ class ChatManager:
             return
         self.__is_generating = True
         
-        asyncio.run(self.process_response(characters.last_added_character, blocking_queue, messages, characters, actions))
+        current_context = otel_context.get_current()
+        asyncio.run(self.process_response(characters.last_added_character, blocking_queue, messages, characters, actions, current_context))
     
     @utils.time_it
     def stop_generation(self):
@@ -203,7 +209,7 @@ class ChatManager:
         return None
 
     @utils.time_it
-    async def process_response(self, active_character: Character, blocking_queue: sentence_queue, messages : message_thread, characters: Characters, actions: list[action]):
+    async def process_response(self, active_character: Character, blocking_queue: sentence_queue, messages : message_thread, characters: Characters, actions: list[action], parent_context):
         """Stream response from LLM one sentence at a time"""
 
         try:
@@ -221,7 +227,7 @@ class ChatManager:
             while True:
                 try:
                     start_time = time.time()
-                    async for content in self.__client.streaming_call(messages=messages, is_multi_npc=characters.contains_multiple_npcs()):
+                    async for content in self.__client.streaming_call(messages=messages, is_multi_npc=characters.contains_multiple_npcs(), parent_context=parent_context):
                         if self.__stop_generation.is_set():
                             break
                         if not content:

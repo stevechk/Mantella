@@ -20,6 +20,8 @@ from src.http.communication_constants import communication_constants as comm_con
 from src.stt import Transcriber
 import src.utils as utils
 from src.function_inference.function_manager import get_function_manager_instance
+from src.telemetry.telemetry import create_span_with_parent, create_span, span
+from opentelemetry import context as otel_context
 
 class conversation_continue_type(Enum):
     NPC_TALK = 1
@@ -76,6 +78,7 @@ class conversation:
         return self.__stt
     
     @utils.time_it
+    @span(name="conversation.add_or_update_character")
     def add_or_update_character(self, new_character: list[Character]):
         """Adds or updates a character in the conversation.
 
@@ -89,6 +92,7 @@ class conversation:
             self.__save_conversations_for_characters(all_characters, is_reload=True)
 
     @utils.time_it
+    @span(name="conversation.start_conversation")
     def start_conversation(self) -> tuple[str, sentence | None]:
         """Starts a new conversation.
 
@@ -104,6 +108,7 @@ class conversation:
             return comm_consts.KEY_REPLYTYPE_PLAYERTALK, None
 
     @utils.time_it
+    @span(name="conversation.continue_conversation")
     def continue_conversation(self) -> tuple[str, sentence | None]:
         """Main workhorse of the conversation. Decides what happens next based on the state of the conversation
 
@@ -141,13 +146,19 @@ class conversation:
             #if there is a next sentence and it actually has content, return it as something for an NPC to say 
             if self.last_sentence_audio_length > 0:
                 logging.info(f'Waiting {round(self.last_sentence_audio_length, 1)} seconds for last voiceline to play')
-            # before immediately sending the next voiceline, give the player the chance to interrupt
-            while time.time() - self.last_sentence_start_time < self.last_sentence_audio_length:
-                if self.__stt:
-                    if self.__stt and self.__stt.has_player_spoken():
-                        self.__stop_generation()
-                        self.__sentences.clear()
-                        return comm_consts.KEY_REQUESTTYPE_TTS, None
+
+            with create_span("wait_for_last_sentence_to_play") as span:
+                span.set_attribute("last_sentence_audio_length", self.last_sentence_audio_length)
+                if self.__messages.get_last_message():
+                    last_spoken_message = self.__messages.get_last_message().get_formatted_content()
+                    span.set_attribute("last_sentence", last_spoken_message)
+                # before immediately sending the next voiceline, give the player the chance to interrupt
+                while time.time() - self.last_sentence_start_time < self.last_sentence_audio_length:
+                    if self.__stt:
+                        if self.__stt and self.__stt.has_player_spoken():
+                            self.__stop_generation()
+                            self.__sentences.clear()
+                            return comm_consts.KEY_REQUESTTYPE_TTS, None
                     time.sleep(0.01)
             self.last_sentence_audio_length = next_sentence.voice_line_duration + self.__context.config.wait_time_buffer
             self.last_sentence_start_time = time.time()
@@ -168,6 +179,7 @@ class conversation:
                     return comm_consts.KEY_REPLYTYPE_PLAYERTALK, None
 
     @utils.time_it
+    @span(name="conversation.process_player_input")
     def process_player_input(self, player_text: str):
         """Submit the input of the player to the conversation
 
@@ -228,6 +240,7 @@ class conversation:
         return mic_prompt
 
     @utils.time_it
+    @span(name="conversation.update_context")
     def update_context(self, location: str | None, time: int, custom_ingame_events: list[str] | None, weather: str | None, custom_context_values: dict[str, Any] | None, config_settings: dict[str, Any] | None):
         """Updates the context with a new set of values
 
@@ -266,6 +279,7 @@ class conversation:
                 self.__messages.reload_message_thread(new_prompt, self.__openai_client.calculate_tokens_from_text, int(self.__openai_client.token_limit * self.TOKEN_LIMIT_RELOAD_MESSAGES))
 
     @utils.time_it
+    @span(name="conversation.update_game_events")
     def update_game_events(self, message: user_message) -> user_message:
         """Add in-game events to player's response"""
 
@@ -280,6 +294,7 @@ class conversation:
         return message
 
     @utils.time_it
+    @span(name="conversation.retrieve_sentence_from_queue")
     def retrieve_sentence_from_queue(self) -> sentence | None:
         """Retrieves the next sentence from the queue.
         If there is a sentence, adds the sentence to the last assistant_message of the message_thread.
@@ -302,6 +317,7 @@ class conversation:
         return next_sentence
    
     @utils.time_it
+    @span(name="conversation.initiate_end_sequence")
     def initiate_end_sequence(self):
         """Replaces all remaining sentences with a "goodbye" sentence that also prompts the game to request a stop to the conversation using an action
         """
@@ -333,6 +349,7 @@ class conversation:
         return None
 
     @utils.time_it
+    @span(name="conversation.end")
     def end(self):
         """Ends a conversation
         """
@@ -341,13 +358,22 @@ class conversation:
         self.__sentences.clear()        
         self.__save_conversation(is_reload=False)
     
+    def __generate_response_with_context(self, messages, characters, blocking_queue, actions, parent_context):
+        """Wrapper function to propagate OpenTelemetry context into the thread"""
+        with create_span_with_parent("conversation_response_generation", parent_context) as span:
+            span.set_attribute("conversation.type", "npc_response")
+            span.set_attribute("characters.count", len(characters.get_all_characters()))
+            span.set_attribute("actions.count", len(actions))
+            self.__output_manager.generate_response(messages, characters, blocking_queue, actions)
+
     @utils.time_it
     def __start_generating_npc_sentences(self):
         """Starts a background Thread to generate sentences into the sentence_queue"""    
         with self.__generation_start_lock:
             if not self.__generation_thread:
                 self.__sentences.is_more_to_come = True
-                self.__generation_thread = Thread(None, self.__output_manager.generate_response, None, [self.__messages, self.__context.npcs_in_conversation, self.__sentences, self.context.config.actions]).start()   
+                current_context = otel_context.get_current()                
+                self.__generation_thread = Thread(None, self.__generate_response_with_context, None, [self.__messages, self.__context.npcs_in_conversation, self.__sentences, self.context.config.actions, current_context]).start()
 
     @utils.time_it
     def __stop_generation(self):
@@ -370,6 +396,7 @@ class conversation:
                 self.__sentences.put(goodbye_sentence)        
 
     @utils.time_it
+    @span(name="conversation.save_conversation")
     def __save_conversation(self, is_reload: bool):
         """Saves conversation log and state for each NPC in the conversation"""
         self.__save_conversations_for_characters(self.__context.npcs_in_conversation.get_all_characters(), is_reload)
@@ -384,6 +411,7 @@ class conversation:
         self.__rememberer.save_conversation_state(self.__messages, characters_object, self.__context.world_id, is_reload)
 
     @utils.time_it
+    @span(name="conversation.initiate_reload_conversation")
     def __initiate_reload_conversation(self):
         """Places a "gather thoughts" sentence add the front of the queue that also prompts the game to request a reload of the conversation using an action"""
         latest_npc = self.__context.npcs_in_conversation.last_added_character

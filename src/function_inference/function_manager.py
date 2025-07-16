@@ -16,6 +16,8 @@ from src.function_inference.llm_function_class import Target
 from src.llm.sentence import sentence
 from itertools import zip_longest
 from src.http.communication_constants import communication_constants as comm_consts
+from opentelemetry import trace
+from src.telemetry.telemetry import create_span, create_span_with_parent
 
 
 class FunctionManager:
@@ -152,82 +154,104 @@ class FunctionManager:
         '''Main workhorse for the function call handling this function will parse the context and json files to build a tools set and a prompt to send to the LLM.
         Then it will parse the results and send those back to the conversation script'''
         logging.debug(f"Intiating function call preparation")
-        self.__tools_manager.clear_all_active_tooltips()
-        self.clear_llm_output_data()  # Initialize to None for safety
-        processed_game_name = self.__context.config.game.lower().replace(" ", "")
-        
-        characters = self.context.npcs_in_conversation.get_all_characters()
-        conversation_is_multi_npc = self.__context.npcs_in_conversation.contains_multiple_npcs()
-        # Iterate through the characters to find the first non-player character
-        playerName = ""
-        speakerName = ""
-        for character in characters:
-            if character.is_player_character:
-                playerName = character.name
-            if not character.is_player_character:
-                speakerName = character.name
 
-        toolsToSend, system_prompt_array = self.gather_functions_and_tooltips_to_send(
-            processed_game_name=processed_game_name,
-            conversation_is_multi_npc=conversation_is_multi_npc,
-            playerName=playerName
-            )                  
+        with create_span("function_call_processing") as span:
+            span.set_attribute("function_call.has_main_messages", bool(mainConversationThreadMessages))
+            span.set_attribute("function_call.has_last_message", bool(lastUserMessage))
 
-        if toolsToSend:
+            self.__tools_manager.clear_all_active_tooltips()
+            self.clear_llm_output_data()  # Initialize to None for safety
+            processed_game_name = self.__context.config.game.lower().replace(" ", "")
             
-            system_prompt_LLMFunction_instructions = self.format_system_prompt_instructions(system_prompt_array)
-            logging.debug(f"Functions sent to Function LLM : {toolsToSend}")
-            tooltipsToAppend = self.__tools_manager.list_all_tooltips()
-            logging.debug(f"Tooltips sent to Function LLM is {tooltipsToAppend}")
-            #the message below will need to be customized dynamically according to what is sent to the LLM.
+            characters = self.context.npcs_in_conversation.get_all_characters()
+            conversation_is_multi_npc = self.__context.npcs_in_conversation.contains_multiple_npcs()
+            # Iterate through the characters to find the first non-player character
+            playerName = ""
+            speakerName = ""
+            for character in characters:
+                if character.is_player_character:
+                    playerName = character.name
+                if not character.is_player_character:
+                    speakerName = character.name
 
-            if conversation_is_multi_npc:
-                if self.__context.config.function_llm_api == 'OpenAI':
-                    initial_system_message = self.__context.config.function_LLM_OpenAI_multi_NPC_prompt
-                else:
-                    initial_system_message = self.__context.config.function_LLM_multi_NPC_prompt
-            else:
-                if self.__context.config.function_llm_api == 'OpenAI':
-                    initial_system_message = self.__context.config.function_LLM_OpenAI_single_NPC_prompt
-                else:
-                    initial_system_message = self.__context.config.function_LLM_single_NPC_prompt
-            
-            kwargs={
-                "speakerName": speakerName,
-                "playerName": playerName,
-                "system_prompt_LLMFunction_instructions": system_prompt_LLMFunction_instructions,
-                "toolsToSend": toolsToSend
-            }
-            initial_system_message = self.format_with_stop_marker(initial_system_message, "NO_REGEX_FORMATTING_PAST_THIS_POINT", **kwargs)
-            self.__messages = message_thread(initial_system_message)
-            self.__messages.add_message(user_message(tooltipsToAppend)) 
-            self.__messages.add_message(user_message(lastUserMessage)) 
-            result_was_generated:bool = True
-            self.__generation_thread = Thread(
-                target=self.__output_manager.generate_simple_response_from_message_thread, 
-                args=[self.__messages, "function", toolsToSend]
-            )
-            self.__generation_thread.start()
+            span.set_attribute("function_call.speaker_name", speakerName)
+            span.set_attribute("function_call.conversation_is_multi_npc", conversation_is_multi_npc)
 
-            # Wait at most 5 seconds for the LLM response
-            self.__generation_thread.join(timeout=self.__context.config.function_LLM_timeout)
-
-            if self.__generation_thread.is_alive():
-                logging.warning("LLM generation took too long. Proceeding without the LLM result.")
-                result_was_generated=False
-
-            self.__generation_thread = None
-            if not result_was_generated:
-                return None
-            else:
-                result_message = self._handle_generated_function_results(
-                speakerName=speakerName,
+            toolsToSend, system_prompt_array = self.gather_functions_and_tooltips_to_send(
+                processed_game_name=processed_game_name,
+                conversation_is_multi_npc=conversation_is_multi_npc,
                 playerName=playerName
+                )                  
+
+            span.set_attribute("function_call.tools_count", len(toolsToSend) if toolsToSend else 0)
+
+            if toolsToSend:
+                system_prompt_LLMFunction_instructions = self.format_system_prompt_instructions(system_prompt_array)
+                logging.debug(f"Functions sent to Function LLM : {toolsToSend}")
+                tooltipsToAppend = self.__tools_manager.list_all_tooltips()
+                logging.debug(f"Tooltips sent to Function LLM is {tooltipsToAppend}")
+                #the message below will need to be customized dynamically according to what is sent to the LLM.
+
+                if conversation_is_multi_npc:
+                    if self.__context.config.function_llm_api == 'OpenAI':
+                        initial_system_message = self.__context.config.function_LLM_OpenAI_multi_NPC_prompt
+                    else:
+                        initial_system_message = self.__context.config.function_LLM_multi_NPC_prompt
+                else:
+                    if self.__context.config.function_llm_api == 'OpenAI':
+                        initial_system_message = self.__context.config.function_LLM_OpenAI_single_NPC_prompt
+                    else:
+                        initial_system_message = self.__context.config.function_LLM_single_NPC_prompt
+                
+                kwargs={
+                    "speakerName": speakerName,
+                    "playerName": playerName,
+                    "system_prompt_LLMFunction_instructions": system_prompt_LLMFunction_instructions,
+                    "toolsToSend": toolsToSend
+                }
+                initial_system_message = self.format_with_stop_marker(initial_system_message, "NO_REGEX_FORMATTING_PAST_THIS_POINT", **kwargs)
+                self.__messages = message_thread(initial_system_message)
+                self.__messages.add_message(user_message(tooltipsToAppend)) 
+                self.__messages.add_message(user_message(lastUserMessage)) 
+                result_was_generated:bool = True
+                
+                # Capture the current OpenTelemetry context before creating the thread
+                from opentelemetry import context as otel_context
+                from opentelemetry import trace
+                current_context = otel_context.get_current()
+                
+                def function_call_with_context(messages, response_type, tools_list):
+                    """Wrapper function that restores the OpenTelemetry context in the new thread"""
+                    with create_span_with_parent("function_call_thread", current_context) as thread_span:
+                        thread_span.set_attribute("function_call.thread_id", "background_thread")
+                        return self.__output_manager.generate_simple_response_from_message_thread(messages, response_type, tools_list)
+                
+                self.__generation_thread = Thread(
+                    target=function_call_with_context, 
+                    args=[self.__messages, "function", toolsToSend]
                 )
-                if result_message:
-                    return result_message #Returning the result to Conversation script
-        else:
-            logging.debug("Function Manager : No eligible functions found.")
+                self.__generation_thread.start()
+
+                # Wait at most 5 seconds for the LLM response
+                self.__generation_thread.join(timeout=self.__context.config.function_LLM_timeout)
+
+                if self.__generation_thread.is_alive():
+                    logging.warning("LLM generation took too long. Proceeding without the LLM result.")
+                    result_was_generated=False
+
+                self.__generation_thread = None
+                if not result_was_generated:
+                    return None
+                else:
+                    result_message = self._handle_generated_function_results(
+                    speakerName=speakerName,
+                    playerName=playerName
+                    )
+                    if result_message:
+                        return result_message #Returning the result to Conversation script
+            else:
+                logging.debug("Function Manager : No eligible functions found.")
+                return None
 
     def gather_functions_and_tooltips_to_send(
         self,

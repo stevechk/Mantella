@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 from pathlib import Path
 from src.config.config_loader import ConfigLoader
+from src.telemetry.telemetry import get_telemetry_manager
 
 def initialise(config_file, logging_file, language_file) -> tuple[ConfigLoader, dict[Hashable, str]]:
     
@@ -116,5 +117,13 @@ config.ini, logging.log, and conversation histories available in:
     utils.cleanup_tmp(config.save_folder+'data\\tmp')
 
     language_info = get_language_info(language_file)
+    
+    # Initialize telemetry system
+    telemetry_manager = get_telemetry_manager()
+    enable_telemetry = getattr(config, 'enable_telemetry', True)
+    telemetry_manager.initialize(
+        config=config,
+        enable_telemetry=enable_telemetry
+    )
     
     return config, language_info
