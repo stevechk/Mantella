@@ -10,8 +10,9 @@ import pandas as pd
 import sys
 from pathlib import Path
 from src.config.config_loader import ConfigLoader
+from src.telemetry.telemetry import get_telemetry_manager
 
-def initialise(config_file, logging_file, language_file) -> tuple[ConfigLoader, dict[Hashable, str]]:
+def initialise(config_file, logging_file, language_file, version) -> tuple[ConfigLoader, dict[Hashable, str]]:
     
     def set_cwd_to_exe_dir():
         if getattr(sys, 'frozen', False): # if exe and not Python script
@@ -123,6 +124,16 @@ def initialise(config_file, logging_file, language_file) -> tuple[ConfigLoader, 
         except:
             logging.error(f"Could not load language '{config.language}'. Please set a valid language in config.ini\n")
             return {}
+        
+    def setup_telemetry(config: ConfigLoader, version: str):
+        telemetry_manager = get_telemetry_manager()
+        enable_telemetry = getattr(config, 'enable_telemetry', False)
+        telemetry_manager.initialize(
+            config=config,
+            version=version,
+            enable_telemetry=enable_telemetry,
+        )
+
     set_cwd_to_exe_dir()
     save_folder = get_my_games_directory()
     config = ConfigLoader(save_folder, config_file)    
@@ -142,5 +153,5 @@ config.ini, logging.log, and conversation histories available in:
     utils.cleanup_tmp(config.save_folder+'data\\tmp')
 
     language_info = get_language_info(language_file)
-    
+    setup_telemetry(config, version)
     return config, language_info

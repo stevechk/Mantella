@@ -9,12 +9,14 @@ from src.ui.start_ui import StartUI
 
 def main():
     try:
+        mantella_version = '0.13 Preview 2'
+
         config, language_info = setup.initialise(
             config_file='config.ini',
             logging_file='logging.log', 
-            language_file='data/language_support.csv')
+            language_file='data/language_support.csv',
+            version=mantella_version)
 
-        mantella_version = '0.13 Preview 2'
         logging.log(24, f'\nMantella v{mantella_version}')
 
         mantella_http_server = http_server()

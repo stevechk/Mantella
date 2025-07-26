@@ -6,6 +6,7 @@ import time
 import re
 import unicodedata
 from openai import APIConnectionError
+from opentelemetry.context.context import Context
 from src.games.gameable import gameable
 from src.conversation.action import action
 from src.llm.sentence_queue import sentence_queue
@@ -19,6 +20,7 @@ from src.llm.message_thread import message_thread
 from src.llm.llm_client import LLMClient
 from src.tts.ttsable import ttsable
 from src.tts.synthesization_options import SynthesizationOptions
+from src.telemetry.telemetry import create_span_with_parent
 
 class ChatManager:
     def __init__(self, game: gameable, config: ConfigLoader, tts: ttsable, client: LLMClient):
@@ -79,7 +81,7 @@ class ChatManager:
             return self.__client.num_tokens_from_message(content_to_measure)
 
     @utils.time_it
-    def generate_response(self, messages: message_thread, characters: Characters, blocking_queue: sentence_queue, actions: list[action]):
+    def generate_response(self, messages: message_thread, characters: Characters, blocking_queue: sentence_queue, actions: list[action], current_context: Context):
         """Starts generating responses by the LLM for the current state of the input messages
 
         Args:
@@ -88,11 +90,15 @@ class ChatManager:
             blocking_queue (sentence_queue): _description_
             actions (list[action]): _description_
         """
-        if(not characters.last_added_character):
-            return
-        self.__is_generating = True
-        
-        asyncio.run(self.process_response(characters.last_added_character, blocking_queue, messages, characters, actions))
+        with create_span_with_parent("generate_response", current_context) as span:
+
+            if(not characters.last_added_character):
+                return
+
+            span.set_attribute("last_added_character.name", characters.last_added_character.name)        
+            self.__is_generating = True
+            
+            asyncio.run(self.process_response(characters.last_added_character, blocking_queue, messages, characters, actions, current_context))
     
     @utils.time_it
     def stop_generation(self):
@@ -183,7 +189,7 @@ class ChatManager:
         return None
 
     @utils.time_it
-    async def process_response(self, active_character: Character, blocking_queue: sentence_queue, messages : message_thread, characters: Characters, actions: list[action]):
+    async def process_response(self, active_character: Character, blocking_queue: sentence_queue, messages : message_thread, characters: Characters, actions: list[action], current_context: Context):
         """Stream response from LLM one sentence at a time"""
 
         try:
@@ -201,7 +207,7 @@ class ChatManager:
             while True:
                 try:
                     start_time = time.time()
-                    async for content in self.__client.streaming_call(messages=messages, is_multi_npc=characters.contains_multiple_npcs()):
+                    async for content in self.__client.streaming_call(messages=messages, is_multi_npc=characters.contains_multiple_npcs(), current_context=current_context):
                         if self.__stop_generation.is_set():
                             break
                         if not content:

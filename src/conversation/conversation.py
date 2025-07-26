@@ -4,6 +4,7 @@ from threading import Thread, Lock
 import time
 from typing import Any
 from src.llm.llm_client import LLMClient
+from opentelemetry import context as otel_context
 from src.characters_manager import Characters
 from src.conversation.conversation_log import conversation_log
 from src.conversation.action import action
@@ -328,7 +329,8 @@ class conversation:
         with self.__generation_start_lock:
             if not self.__generation_thread:
                 self.__sentences.is_more_to_come = True
-                self.__generation_thread = Thread(None, self.__output_manager.generate_response, None, [self.__messages, self.__context.npcs_in_conversation, self.__sentences, self.context.config.actions]).start()   
+                current_context = otel_context.get_current() 
+                self.__generation_thread = Thread(None, self.__output_manager.generate_response, None, [self.__messages, self.__context.npcs_in_conversation, self.__sentences, self.context.config.actions, current_context]).start()   
 
     @utils.time_it
     def __stop_generation(self):
